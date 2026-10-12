@@ -1,0 +1,57 @@
+name: deal-tracker
+on:
+  schedule:
+    - cron: '15 15 * * *'   # 15:15 UTC = 20:45 IST; runner waits for 21:00 IST
+  workflow_dispatch:
+    inputs:
+      test_minutes:
+        description: 'Test duration in minutes (bypasses IST window). 0 = normal 21:00-01:00 IST slot'
+        default: '0'
+      autopost:
+        description: 'Post to the channel'
+        type: boolean
+        default: false
+concurrency:
+  group: deal-tracker
+  cancel-in-progress: false
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      TZ: Asia/Kolkata
+      TRACK_CHANNEL: deals
+      TRACK_INTERVAL: '10'
+      TRACK_MIN_DISCOUNT: '40'
+      TRACK_BATCH_DELAY_S: '1200'
+      TRACK_AUTOPOST: ${{ (github.event_name == 'schedule' || inputs.autopost) && '1' || '0' }}
+      TRACK_DRYRUN_PROBE: ${{ (github.event_name != 'schedule' && !inputs.autopost) && '8' || '' }}
+      TEST_MINUTES: ${{ inputs.test_minutes || '0' }}
+      DEALWALA_BOT_TOKEN: ${{ secrets.DEALWALA_BOT_TOKEN }}
+      AMAZON_TAG: ${{ secrets.AMAZON_TAG }}
+      CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+      STATUS_CHAT_ID: ${{ secrets.STATUS_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check secrets
+        run: |
+          for v in DEALWALA_BOT_TOKEN AMAZON_TAG CHANNEL_ID; do
+            [ -n "${!v}" ] || { echo "::error::Missing repo secret $v"; exit 1; }
+          done
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: tracker-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: tracker-state-
+      - name: Run slot
+        run: python3 -u run_slot.py
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: tracker-state-${{ github.run_id }}-${{ github.run_attempt }}

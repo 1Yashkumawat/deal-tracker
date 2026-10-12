@@ -1,0 +1,9 @@
+state/
+*.log
+*.jsonl
+*.pid
+*.bak*
+seen_*.json
+pending_batch.json
+__pycache__/
+.env

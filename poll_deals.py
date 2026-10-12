@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""Poll the public preview of a Telegram channel (no admin, no bot token) and
+record new Amazon links, deduplicated by ASIN (or normalized URL for non-product links).
+With TRACK_AUTOPOST=1: high-discount (>= TRACK_MIN_DISCOUNT, default 40%) posts instantly;
+low-discount ASINs wait TRACK_BATCH_DELAY_S (default 1200s = 20 min) then post.
+Never posts anywhere without AUTOPOST. Output: new_links.jsonl, seen_*.json, pending_batch.json.
+"""
+import html, json, re, sys, time, urllib.request, os, subprocess
+from datetime import datetime, timezone, timedelta
+
+CHANNEL = os.environ.get("TRACK_CHANNEL", "deals")
+BASE = os.environ.get("TRACK_STATE_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
+os.makedirs(BASE, exist_ok=True)
+POSTER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deal_drop_post.py")
+SEEN = f"{BASE}/seen_{CHANNEL}.json"
+OUT = f"{BASE}/new_links.jsonl"
+PENDING = f"{BASE}/pending_batch.json"
+POSTED = f"{BASE}/posted.jsonl"
+IST = timezone(timedelta(hours=5, minutes=30))
+MAX_AGE_S = 900  # never post a backlog older than 15 min (e.g. after a restart)
+MIN_DISCOUNT = float(os.environ.get("TRACK_MIN_DISCOUNT", "40"))
+BATCH_DELAY_S = int(os.environ.get("TRACK_BATCH_DELAY_S", "1200"))  # 20 min mid of 15-30
+
+
+def fetch():
+    req = urllib.request.Request(f"https://t.me/s/{CHANNEL}", headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def parse(page):
+    blocks = re.split(r'(?=<div class="tgme_widget_message_wrap)', page)
+    posts = []
+    for b in blocks:
+        m = re.search(r'data-post="%s/(\d+)"' % re.escape(CHANNEL), b)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        t = re.search(r'<time datetime="([^"]+)"', b)
+        txt = re.search(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', b, re.S)
+        text = ""
+        if txt:
+            text = re.sub(r"<br\s*/?>", "\n", txt.group(1))
+            text = html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+        title = next((l.strip() for l in text.splitlines() if l.strip()), "")
+        links = []
+        for h in re.findall(r'href="([^"]+)"', b):
+            u = html.unescape(html.unescape(h))
+            if re.search(r"(amazon\.in|amzn\.(to|in))", u):
+                links.append(u)
+        posts.append({"post": pid, "time": t.group(1) if t else None, "title": title[:160], "links": links})
+    return posts
+
+
+def key_for(u):
+    a = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})", u)
+    if a:
+        return "ASIN:" + a.group(1)
+    return "URL:" + re.sub(r"[?&](tag|ref|btn_ref|qid|ds|dc|smid|psc|th)=[^&]*", "", u)
+
+
+def load_pending():
+    if not os.path.exists(PENDING):
+        return []
+    try:
+        return json.load(open(PENDING))
+    except Exception:
+        return []
+
+
+def save_pending(items):
+    json.dump(items, open(PENDING, "w"), ensure_ascii=False, indent=0)
+
+
+def queue_low(r, defer_note=""):
+    items = load_pending()
+    asin = r["key"][5:] if r["key"].startswith("ASIN:") else None
+    if not asin:
+        return
+    if any(x.get("asin") == asin for x in items):
+        return
+    ready = datetime.now(IST) + timedelta(seconds=BATCH_DELAY_S)
+    items.append({
+        "asin": asin,
+        "src_post": r["post"],
+        "src_time": r["post_time"],
+        "found_at": r["found_at"],
+        "ready_at": ready.isoformat(timespec="seconds"),
+        "note": defer_note,
+    })
+    save_pending(items)
+    print("queued low_discount", asin, "ready", ready.strftime("%H:%M:%S"), defer_note, flush=True)
+
+
+def run_post(asin, r_meta, allow_low=False):
+    t0 = time.perf_counter()
+    cmd = [sys.executable, POSTER, f"https://www.amazon.in/dp/{asin}", "--tracker-source"]
+    if allow_low:
+        cmd.append("--allow-low-discount")
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    out = {
+        "asin": asin,
+        "src_post": r_meta.get("src_post") or r_meta.get("post"),
+        "src_time": r_meta.get("src_time") or r_meta.get("post_time"),
+        "found_at": r_meta.get("found_at"),
+        "posted_at": datetime.now(IST).isoformat(timespec="seconds"),
+        "run_s": round(time.perf_counter() - t0, 2),
+        "exit": res.returncode,
+        "out": (res.stdout + res.stderr)[-400:],
+        "allow_low": allow_low,
+    }
+    with open(POSTED, "a") as f:
+        f.write(json.dumps(out, ensure_ascii=False) + "\n")
+    print("autopost", asin, "exit", res.returncode, ("low_batch" if allow_low else "instant"), flush=True)
+    return res
+
+
+def flush_pending():
+    items = load_pending()
+    if not items:
+        return
+    now = datetime.now(IST)
+    keep = []
+    for it in items:
+        try:
+            ready = datetime.fromisoformat(it["ready_at"])
+            if ready.tzinfo is None:
+                ready = ready.replace(tzinfo=IST)
+        except Exception:
+            ready = now
+        if ready > now:
+            keep.append(it)
+            continue
+        # Age guard from original source post time
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(it["src_time"])).total_seconds()
+        except Exception:
+            age = 0
+        # After batch delay, allow post even if original 15min window passed — but cap at 45 min total
+        if age > 2700:
+            print("drop stale low_batch", it["asin"], "age", int(age), flush=True)
+            continue
+        run_post(it["asin"], it, allow_low=True)
+    save_pending(keep)
+
+
+def autopost(r):
+    if not r["key"].startswith("ASIN:"):
+        return
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(r["post_time"])).total_seconds()
+    except Exception:
+        age = 0
+    if age > MAX_AGE_S:
+        return
+    asin = r["key"][5:]
+    res = run_post(asin, r, allow_low=False)
+    if res.returncode == 2:
+        note = ""
+        for line in (res.stdout or "").splitlines():
+            if line.startswith("defer "):
+                note = line
+                break
+        queue_low(r, note)
+
+
+def probe(new):
+    """Dry run: fetch Amazon pages for new ASINs and report price parse, never posts."""
+    limit = int(os.environ.get("TRACK_DRYRUN_PROBE", "0"))
+    asins = [r["key"][5:] for r in new if r["key"].startswith("ASIN:")][-limit:]
+    for a in asins:
+        res = subprocess.run([sys.executable, POSTER, f"https://www.amazon.in/dp/{a}", "--tracker-source", "--dry-run"],
+                             capture_output=True, text=True, timeout=60)
+        last = (res.stdout + res.stderr).strip().splitlines()
+        print("probe", a, "exit", res.returncode, last[-1] if last else "", flush=True)
+
+
+def run_once():
+    seen = {}
+    if os.path.exists(SEEN):
+        seen = json.load(open(SEEN))
+    new = []
+    for p in parse(fetch()):
+        for u in dict.fromkeys(p["links"]):
+            k = key_for(u)
+            if k in seen:
+                continue
+            seen[k] = {"post": p["post"], "first_seen": datetime.now(IST).isoformat(timespec="seconds")}
+            rec = {"channel": CHANNEL, "post": p["post"], "post_time": p["time"], "title": p["title"],
+                   "key": k, "url": u, "found_at": seen[k]["first_seen"]}
+            new.append(rec)
+    if new:
+        with open(OUT, "a") as f:
+            for r in new:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    json.dump(seen, open(SEEN, "w"))
+    if os.environ.get("TRACK_DRYRUN_PROBE"):
+        probe(new)
+    if os.environ.get("TRACK_AUTOPOST") == "1":
+        flush_pending()
+        for r in new:
+            autopost(r)
+        flush_pending()
+    return new
+
+
+if __name__ == "__main__":
+    if "--loop" in sys.argv:
+        interval = int(os.environ.get("TRACK_INTERVAL", "60"))
+        while True:
+            try:
+                n = run_once()
+                print(datetime.now(IST).strftime("%H:%M:%S"), "new", len(n), flush=True)
+            except Exception as e:
+                print(datetime.now(IST).strftime("%H:%M:%S"), "error", type(e).__name__, e, flush=True)
+            time.sleep(interval)
+    elif "--flush-pending" in sys.argv:
+        flush_pending()
+    else:
+        for r in run_once():
+            print(json.dumps(r, ensure_ascii=False))
