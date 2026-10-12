@@ -68,7 +68,6 @@ def source_price(text):
     return {"price": price.replace(",", ""), "mrp": mrp.group(1).replace(",", "") if mrp else ""}
 
 
-RETRY = None  # set below (needs BASE)
 BACKOFF_S = [60, 120, 240, 360]  # ~13 min total, inside the 15-min freshness window
 
 
