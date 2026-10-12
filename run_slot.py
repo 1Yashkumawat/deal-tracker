@@ -84,6 +84,15 @@ def main():
         print("heartbeat/alerts disabled: STATUS_CHAT_ID not set", flush=True)
     if os.environ.get("FORCE_ALERT"):
         alert("test", "Test alert from workflow_dispatch (FORCE_ALERT). Alerts work.")
+    nb = int(os.environ.get("TRACK_PROBE_BACKLOG") or 0)
+    if nb and os.environ.get("TRACK_DRYRUN_PROBE"):  # dry-run measurement: probe the newest N page deals too
+        recs = [{"key": pd.key_for(u), "post_time": p["time"], "title": p["title"], "src_price": p["src_price"]}
+                for p in pd.parse(pd.fetch()) for u in dict.fromkeys(p["links"])]
+        recs = [r for r in recs if r["key"].startswith("ASIN:")]
+        print("backlog probe", len(recs[-nb:]), "of", len(recs), "page ASINs;",
+              sum(1 for r in recs[-nb:] if r["src_price"]), "have explicit source price", flush=True)
+        for r in recs[-nb:]:
+            pd.probe_one(r["key"][5:], r)
     posted_seen = sum(1 for _ in open(pd.POSTED)) if os.path.exists(pd.POSTED) else 0
     msg_id, last_hb, fetch_fail_since, last_err, amz_fail_streak = None, 0, None, "", 0
     interval = int(os.environ.get("TRACK_INTERVAL", "10"))

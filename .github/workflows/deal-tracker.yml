@@ -15,6 +15,9 @@ on:
         description: 'Dry-run only: also test the source-post price fallback'
         type: boolean
         default: false
+      probe_backlog:
+        description: 'Dry-run only: also probe the newest N deals on the page'
+        default: '0'
       force_alert:
         description: 'Send a test alert to STATUS_CHAT_ID'
         type: boolean
@@ -38,6 +41,7 @@ jobs:
       TRACK_AUTOPOST: ${{ (github.event_name == 'schedule' || inputs.autopost) && '1' || '0' }}
       TRACK_DRYRUN_PROBE: ${{ (github.event_name != 'schedule' && !inputs.autopost) && '12' || '' }}
       TEST_MINUTES: ${{ inputs.test_minutes || '0' }}
+      TRACK_PROBE_BACKLOG: ${{ inputs.probe_backlog || '0' }}
       FORCE_ALERT: ${{ inputs.force_alert && '1' || '' }}
       DEALWALA_BOT_TOKEN: ${{ secrets.DEALWALA_BOT_TOKEN }}
       AMAZON_TAG: ${{ secrets.AMAZON_TAG }}
