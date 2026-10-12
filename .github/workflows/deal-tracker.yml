@@ -1,23 +1,29 @@
 name: deal-tracker
 on:
   schedule:
-    - cron: '15 15 * * *'   # 15:15 UTC = 20:45 IST; runner waits for 21:00 IST
+    - cron: '5 0,6,12,18 * * *'   # every 6h (05:35, 11:35, 17:35, 23:35 IST); each run polls ~5h50m
   workflow_dispatch:
     inputs:
       test_minutes:
-        description: 'Test duration in minutes (bypasses IST window). 0 = normal 21:00-01:00 IST slot'
+        description: 'Test duration in minutes. 0 = full run until the next 6h boundary'
         default: '0'
       autopost:
-        description: 'Post to the channel'
+        description: 'Post to the channel (off = dry run, no posts)'
+        type: boolean
+        default: false
+      force_alert:
+        description: 'Send a test alert to STATUS_CHAT_ID'
         type: boolean
         default: false
 concurrency:
   group: deal-tracker
-  cancel-in-progress: false
+  cancel-in-progress: false   # a late run queues behind the current one; never two pollers
+permissions:
+  contents: read
 jobs:
   track:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
     env:
       TZ: Asia/Kolkata
       TRACK_CHANNEL: deals
@@ -27,6 +33,7 @@ jobs:
       TRACK_AUTOPOST: ${{ (github.event_name == 'schedule' || inputs.autopost) && '1' || '0' }}
       TRACK_DRYRUN_PROBE: ${{ (github.event_name != 'schedule' && !inputs.autopost) && '8' || '' }}
       TEST_MINUTES: ${{ inputs.test_minutes || '0' }}
+      FORCE_ALERT: ${{ inputs.force_alert && '1' || '' }}
       DEALWALA_BOT_TOKEN: ${{ secrets.DEALWALA_BOT_TOKEN }}
       AMAZON_TAG: ${{ secrets.AMAZON_TAG }}
       CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
@@ -47,7 +54,7 @@ jobs:
           path: state
           key: tracker-state-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: tracker-state-
-      - name: Run slot
+      - name: Run tracker
         run: python3 -u run_slot.py
       - name: Save state
         if: always()
@@ -55,3 +62,13 @@ jobs:
         with:
           path: state
           key: tracker-state-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Alert on unexpected end
+        if: failure() || cancelled()
+        run: python3 run_slot.py --alert run_ended "Run ended unexpectedly (${{ job.status }}): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: gautamkrishnar/keepalive-workflow@v2

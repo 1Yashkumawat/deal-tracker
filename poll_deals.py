@@ -19,6 +19,7 @@ POSTED = f"{BASE}/posted.jsonl"
 IST = timezone(timedelta(hours=5, minutes=30))
 MAX_AGE_S = 900  # never post a backlog older than 15 min (e.g. after a restart)
 MIN_DISCOUNT = float(os.environ.get("TRACK_MIN_DISCOUNT", "40"))
+PROBE_RESULTS = []
 BATCH_DELAY_S = int(os.environ.get("TRACK_BATCH_DELAY_S", "1200"))  # 20 min mid of 15-30
 
 
@@ -97,7 +98,10 @@ def run_post(asin, r_meta, allow_low=False):
     cmd = [sys.executable, POSTER, f"https://www.amazon.in/dp/{asin}", "--tracker-source"]
     if allow_low:
         cmd.append("--allow-low-discount")
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        res = subprocess.CompletedProcess(cmd, 124, "", "poster timeout")
     out = {
         "asin": asin,
         "src_post": r_meta.get("src_post") or r_meta.get("post"),
@@ -171,8 +175,10 @@ def probe(new):
     for a in asins:
         res = subprocess.run([sys.executable, POSTER, f"https://www.amazon.in/dp/{a}", "--tracker-source", "--dry-run"],
                              capture_output=True, text=True, timeout=60)
+        time.sleep(2)
         last = (res.stdout + res.stderr).strip().splitlines()
         print("probe", a, "exit", res.returncode, last[-1] if last else "", flush=True)
+        PROBE_RESULTS.append({"asin": a, "exit": res.returncode, "out": last[-1] if last else "", "probe": True})
 
 
 def run_once():

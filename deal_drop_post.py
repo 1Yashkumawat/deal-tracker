@@ -171,6 +171,10 @@ def main():
     image = image_of(html)
     if asin in BLOCKED_ASINS:
         die("blocked asin")
+    if "--dry-run" in args:
+        blocked = "captcha" in html.lower() or "robot check" in html.lower()
+        print(f"DRYRUN asin={asin} price={price} mrp={mrp} pct={discount_pct(price, mrp)} captcha={blocked} len={len(html)}")
+        raise SystemExit(0 if price else 3)
     if tracker and not price:
         die("tracker post skipped: no price on Amazon page")
     if dry:
