@@ -2,6 +2,7 @@ name: deal-tracker
 on:
   schedule:
     - cron: '5 0,6,12,18 * * *'   # every 6h (05:35, 11:35, 17:35, 23:35 IST); each run polls ~5h50m
+    - cron: '35 * * * *'          # hourly safety net in case GitHub skips the 6h cron; queues behind any active run
   workflow_dispatch:
     inputs:
       test_minutes:
@@ -75,8 +76,27 @@ jobs:
         if: failure() || cancelled()
         run: |
           python3 run_slot.py --alert run_ended "Run ended unexpectedly (${{ job.status }}) - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+  chain:
+    # Self-chaining: when a live run ends, dispatch the next live run unless one is already queued/running.
+    needs: track
+    if: always() && (github.event_name == 'schedule' || (inputs.autopost && (inputs.test_minutes || '0') == '0'))
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Dispatch next live run
+        run: |
+          others=$(gh run list --workflow deal-tracker.yml --limit 30 --json databaseId,status \
+            --jq "[.[] | select(.databaseId != ${{ github.run_id }}) | select(.status==\"queued\" or .status==\"in_progress\" or .status==\"pending\" or .status==\"waiting\" or .status==\"requested\")] | length")
+          echo "other active/queued runs: $others"
+          if [ "${others:-0}" -gt 0 ]; then echo "Next run already queued; not dispatching."; exit 0; fi
+          gh workflow run deal-tracker.yml --ref "${{ github.ref_name }}" -f test_minutes=0 -f autopost=true
+          echo "Dispatched next live run."
   keepalive:
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' && github.event.schedule == '5 0,6,12,18 * * *'
     runs-on: ubuntu-latest
     permissions:
       actions: write
