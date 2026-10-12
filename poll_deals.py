@@ -20,6 +20,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 MAX_AGE_S = 900  # never post a backlog older than 15 min (e.g. after a restart)
 MIN_DISCOUNT = float(os.environ.get("TRACK_MIN_DISCOUNT", "40"))
 PROBE_RESULTS = []
+RETRY = f"{BASE}/captcha_retry.json"
 BATCH_DELAY_S = int(os.environ.get("TRACK_BATCH_DELAY_S", "1200"))  # 20 min mid of 15-30
 
 
@@ -49,8 +50,26 @@ def parse(page):
             u = html.unescape(html.unescape(h))
             if re.search(r"(amazon\.in|amzn\.(to|in))", u):
                 links.append(u)
-        posts.append({"post": pid, "time": t.group(1) if t else None, "title": title[:160], "links": links})
+        posts.append({"post": pid, "time": t.group(1) if t else None, "title": title[:160], "links": links,
+                      "src_price": source_price(text)})
     return posts
+
+
+_AMT = r"(?:₹|Rs\.?|INR)\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+
+
+def source_price(text):
+    """Explicit price/MRP stated in the source post, else None. Only used when TRACK_SOURCE_PRICE=1."""
+    mrp = re.search(r"(?i)(?:M\.?R\.?P\.?|List price)\D{0,6}" + _AMT, text)
+    amts = [(m.start(), m.group(1)) for m in re.finditer(_AMT, text)]
+    price = next((a for s, a in amts if not mrp or a != mrp.group(1)), None)
+    if not price:
+        return None
+    return {"price": price.replace(",", ""), "mrp": mrp.group(1).replace(",", "") if mrp else ""}
+
+
+RETRY = None  # set below (needs BASE)
+BACKOFF_S = [60, 120, 240, 360]  # ~13 min total, inside the 15-min freshness window
 
 
 def key_for(u):
@@ -88,16 +107,62 @@ def queue_low(r, defer_note=""):
         "found_at": r["found_at"],
         "ready_at": ready.isoformat(timespec="seconds"),
         "note": defer_note,
+        "title": r.get("title"),
+        "src_price": r.get("src_price"),
     })
     save_pending(items)
     print("queued low_discount", asin, "ready", ready.strftime("%H:%M:%S"), defer_note, flush=True)
 
 
-def run_post(asin, r_meta, allow_low=False):
-    t0 = time.perf_counter()
+def poster_cmd(asin, r_meta, allow_low=False, dry=False, final=False):
     cmd = [sys.executable, POSTER, f"https://www.amazon.in/dp/{asin}", "--tracker-source"]
     if allow_low:
         cmd.append("--allow-low-discount")
+    if dry:
+        cmd.append("--dry-run")
+    sp = r_meta.get("src_price")
+    if sp:
+        cmd += [f"--src-price={sp['price']}", f"--src-mrp={sp['mrp']}", f"--src-title={r_meta.get('title', '')}"]
+    if final:
+        cmd.append("--final-try")
+    return cmd
+
+
+def queue_retry(asin, r_meta, attempt, allow_low=False, dry=False):
+    try:
+        items = json.load(open(RETRY))
+    except Exception:
+        items = []
+    if attempt >= len(BACKOFF_S) or any(x["asin"] == asin for x in items):
+        return False
+    due = time.time() + BACKOFF_S[attempt]
+    items.append({"asin": asin, "meta": {k: r_meta.get(k) for k in ("post", "src_post", "post_time", "src_time", "found_at", "title", "src_price")},
+                  "attempt": attempt + 1, "due": due, "allow_low": allow_low, "dry": dry})
+    json.dump(items, open(RETRY, "w"), ensure_ascii=False)
+    print("captcha requeue", asin, "attempt", attempt + 1, "in", BACKOFF_S[attempt], "s", flush=True)
+    return True
+
+
+def flush_retry():
+    try:
+        items = json.load(open(RETRY))
+    except Exception:
+        return
+    now, keep, due = time.time(), [], []
+    for it in items:
+        (due if it["due"] <= now else keep).append(it)
+    json.dump(keep, open(RETRY, "w"), ensure_ascii=False)
+    for it in due:
+        final = it["attempt"] >= len(BACKOFF_S)
+        if it["dry"]:
+            probe_one(it["asin"], it["meta"], it["attempt"], final)
+        else:
+            run_post(it["asin"], it["meta"], it["allow_low"], attempt=it["attempt"], final=final)
+
+
+def run_post(asin, r_meta, allow_low=False, attempt=0, final=False):
+    t0 = time.perf_counter()
+    cmd = poster_cmd(asin, r_meta, allow_low, final=final)
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
@@ -112,10 +177,14 @@ def run_post(asin, r_meta, allow_low=False):
         "exit": res.returncode,
         "out": (res.stdout + res.stderr)[-400:],
         "allow_low": allow_low,
+        "attempt": attempt,
+        "final": final,
     }
     with open(POSTED, "a") as f:
         f.write(json.dumps(out, ensure_ascii=False) + "\n")
     print("autopost", asin, "exit", res.returncode, ("low_batch" if allow_low else "instant"), flush=True)
+    if res.returncode == 4 and not final:
+        queue_retry(asin, r_meta, attempt, allow_low)
     return res
 
 
@@ -168,17 +237,22 @@ def autopost(r):
         queue_low(r, note)
 
 
+def probe_one(a, meta, attempt=0, final=False):
+    res = subprocess.run(poster_cmd(a, meta, dry=True, final=final), capture_output=True, text=True, timeout=120)
+    last = (res.stdout + res.stderr).strip().splitlines()
+    print("probe", a, "attempt", attempt, "exit", res.returncode, last[-1] if last else "", flush=True)
+    if res.returncode == 4 and not final and queue_retry(a, meta, attempt, dry=True):
+        PROBE_RESULTS.append({"asin": a, "exit": 4, "out": "requeued", "probe": True, "requeued": True})
+        return
+    PROBE_RESULTS.append({"asin": a, "exit": res.returncode, "out": last[-1] if last else "", "probe": True,
+                          "attempt": attempt, "src_price": bool(meta.get("src_price"))})
+
+
 def probe(new):
     """Dry run: fetch Amazon pages for new ASINs and report price parse, never posts."""
     limit = int(os.environ.get("TRACK_DRYRUN_PROBE", "0"))
-    asins = [r["key"][5:] for r in new if r["key"].startswith("ASIN:")][-limit:]
-    for a in asins:
-        res = subprocess.run([sys.executable, POSTER, f"https://www.amazon.in/dp/{a}", "--tracker-source", "--dry-run"],
-                             capture_output=True, text=True, timeout=60)
-        time.sleep(2)
-        last = (res.stdout + res.stderr).strip().splitlines()
-        print("probe", a, "exit", res.returncode, last[-1] if last else "", flush=True)
-        PROBE_RESULTS.append({"asin": a, "exit": res.returncode, "out": last[-1] if last else "", "probe": True})
+    for r in [r for r in new if r["key"].startswith("ASIN:")][-limit:]:
+        probe_one(r["key"][5:], r)
 
 
 def run_once():
@@ -192,7 +266,7 @@ def run_once():
             if k in seen:
                 continue
             seen[k] = {"post": p["post"], "first_seen": datetime.now(IST).isoformat(timespec="seconds")}
-            rec = {"channel": CHANNEL, "post": p["post"], "post_time": p["time"], "title": p["title"],
+            rec = {"channel": CHANNEL, "post": p["post"], "post_time": p["time"], "title": p["title"], "src_price": p["src_price"],
                    "key": k, "url": u, "found_at": seen[k]["first_seen"]}
             new.append(rec)
     if new:
@@ -201,8 +275,10 @@ def run_once():
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
     json.dump(seen, open(SEEN, "w"))
     if os.environ.get("TRACK_DRYRUN_PROBE"):
+        flush_retry()
         probe(new)
     if os.environ.get("TRACK_AUTOPOST") == "1":
+        flush_retry()
         flush_pending()
         for r in new:
             autopost(r)

@@ -11,6 +11,7 @@ ALERT_GAP_S = 1800
 MAX_RUN_MIN = 352          # job timeout is 360
 BOUNDARIES_UTC = (0, 6, 12, 18)  # cron '5 0,6,12,18 * * *'
 ALERTS_FILE = os.path.join(pd.BASE, "alerts.json")
+STATS = {"ok": 0, "src": 0, "fail": 0, "retried_ok": 0, "_": 0}
 CHAT = os.environ.get("STATUS_CHAT_ID", "").strip()
 
 
@@ -106,7 +107,12 @@ def main():
         for line in recs + pd.PROBE_RESULTS:
             r = json.loads(line) if isinstance(line, str) else line
             out = r.get("out", "")
-            no_price = "no price" in out or "amazon " in out or "no asin" in out or r.get("exit") == 3
+            if r.get("requeued") or (r.get("exit") == 4 and not r.get("final")):
+                continue  # captcha, will be retried with backoff
+            no_price = ("no price" in out or "ERR amazon" in out or "no asin" in out or r.get("exit") in (3, 4))
+            if r.get("probe"):
+                STATS["ok" if r.get("exit") == 0 and "DRYRUN" in out else ("src" if "SOURCEPRICE" in out else "fail")] += 1
+                STATS["retried_ok" if r.get("exit") == 0 and r.get("attempt") else "_"] += 1
             amz_fail_streak = amz_fail_streak + 1 if no_price else (0 if r.get("exit") in (0, 2) else amz_fail_streak)
             if amz_fail_streak >= 3:
                 alert("amazon_fetch", f"Amazon price fetch failed for {amz_fail_streak} deals in a row (last {r.get('asin')}).")
@@ -130,6 +136,9 @@ def main():
     if CHAT and msg_id:
         tg("editMessageText", {"chat_id": CHAT, "message_id": msg_id,
                                "text": f"Deal Tracker run ended {datetime.now(IST).strftime('%H:%M')} IST (next run starts automatically) • posts today {posts_today()}"})
+    if os.environ.get("TRACK_DRYRUN_PROBE"):
+        t = STATS["ok"] + STATS["src"] + STATS["fail"]
+        print(f"AMAZON SUMMARY amazon_ok={STATS['ok']} (after_retry={STATS['retried_ok']}) source_price_fallback={STATS['src']} failed={STATS['fail']} total={t}", flush=True)
     print("STOP", datetime.now(IST).strftime("%H:%M:%S IST"), flush=True)
 
 

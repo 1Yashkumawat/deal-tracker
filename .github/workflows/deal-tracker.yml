@@ -11,6 +11,10 @@ on:
         description: 'Post to the channel (off = dry run, no posts)'
         type: boolean
         default: false
+      source_price:
+        description: 'Dry-run only: also test the source-post price fallback'
+        type: boolean
+        default: false
       force_alert:
         description: 'Send a test alert to STATUS_CHAT_ID'
         type: boolean
@@ -30,8 +34,9 @@ jobs:
       TRACK_INTERVAL: '10'
       TRACK_MIN_DISCOUNT: '40'
       TRACK_BATCH_DELAY_S: '1200'
+      TRACK_SOURCE_PRICE: ${{ (inputs.source_price && !inputs.autopost) && '1' || vars.TRACK_SOURCE_PRICE || '0' }}   # flagged fallback, default OFF
       TRACK_AUTOPOST: ${{ (github.event_name == 'schedule' || inputs.autopost) && '1' || '0' }}
-      TRACK_DRYRUN_PROBE: ${{ (github.event_name != 'schedule' && !inputs.autopost) && '8' || '' }}
+      TRACK_DRYRUN_PROBE: ${{ (github.event_name != 'schedule' && !inputs.autopost) && '12' || '' }}
       TEST_MINUTES: ${{ inputs.test_minutes || '0' }}
       FORCE_ALERT: ${{ inputs.force_alert && '1' || '' }}
       DEALWALA_BOT_TOKEN: ${{ secrets.DEALWALA_BOT_TOKEN }}

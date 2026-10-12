@@ -39,10 +39,93 @@ def api(method, payload, timeout=30):
     return body["result"]
 
 
-def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-IN,en;q=0.9"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+STATE_DIR = os.environ.get("TRACK_STATE_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
+COOKIES = os.path.join(STATE_DIR, "amazon_cookies.txt")
+LAST_FETCH = os.path.join(STATE_DIR, "amazon_last_fetch")
+MOBILE_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
+HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-IN,en-GB;q=0.9,en;q=0.8,hi;q=0.6",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none", "Sec-Fetch-User": "?1",
+}
+
+
+class Captcha(Exception):
+    pass
+
+
+def _opener():
+    import http.cookiejar
+    os.makedirs(STATE_DIR, exist_ok=True)
+    jar = http.cookiejar.MozillaCookieJar(COOKIES)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=True)
+    except Exception:
+        pass
+    return jar, urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+def _space():
+    """Keep >= 3-6 s (jittered) between Amazon requests across processes."""
+    import random
+    gap = random.uniform(3, 6)
+    try:
+        last = float(open(LAST_FETCH).read())
+    except Exception:
+        last = 0
+    wait = last + gap - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    open(LAST_FETCH, "w").write(str(time.time()))
+
+
+def is_captcha(html):
+    h = html.lower()
+    return ("captcha" in h and "productTitle".lower() not in h) or "api-services-support@amazon.com" in h or len(html) < 8000
+
+
+def _get(opener, url, ua, referer=None):
+    _space()
+    h = dict(HEADERS, **{"User-Agent": ua})
+    if referer:
+        h["Referer"] = referer
+        h["Sec-Fetch-Site"] = "same-origin"
+    with opener.open(urllib.request.Request(url, headers=h), timeout=20) as resp:
         return resp.geturl(), resp.read().decode("utf-8", "replace")
+
+
+def fetch(url):
+    """Shared cookie session, warm-up, jittered spacing, retry + mobile fallback. Raises Captcha."""
+    jar, opener = _opener()
+    if not any(c.domain.endswith("amazon.in") for c in jar):
+        try:
+            _get(opener, "https://www.amazon.in/", UA)
+        except Exception:
+            pass
+    final, html = None, ""
+    m = re.search(r"/dp/([A-Z0-9]{10})", url)
+    tries = [(url, UA), (url, UA)]
+    if m:
+        tries.append((f"https://www.amazon.in/gp/aw/d/{m.group(1)}", MOBILE_UA))
+    for i, (u, ua) in enumerate(tries):
+        if i:
+            time.sleep(4 + 3 * i)
+        try:
+            final, html = _get(opener, u, ua, referer="https://www.amazon.in/")
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (503, 429):
+                raise
+            html = ""
+        if html and not is_captcha(html):
+            break
+    try:
+        jar.save(ignore_discard=True, ignore_expires=True)
+    except Exception:
+        pass
+    if not html or is_captcha(html):
+        raise Captcha()
+    return final, html
 
 
 def clean_title(html, final_url):
@@ -119,6 +202,40 @@ def discount_pct(price_s, mrp_s):
     return round((m - p) / m * 100, 1)
 
 
+def source_post(url, args, tracker, allow_low, user_sent):
+    """FLAGGED fallback (TRACK_SOURCE_PRICE=1): Amazon blocked, use price/MRP stated in the t.me source post."""
+    val = lambda k: next((a.split("=", 1)[1] for a in args if a.startswith(k)), "")
+    asin = re.search(r"/dp/([A-Z0-9]{10})", url).group(1)
+    price, mrp, title = money(val("--src-price=")), money(val("--src-mrp=")) if val("--src-mrp=") else None, val("--src-title=") or "Amazon deal"
+    pct = discount_pct(price, mrp)
+    print(f"SOURCEPRICE asin={asin} price={price} mrp={mrp} pct={pct}")
+    if "--dry-run" in args:
+        raise SystemExit(0)
+    if asin in BLOCKED_ASINS:
+        die("blocked asin")
+    if tracker and not allow_low and not user_sent and (pct is None or pct < float(os.environ.get("TRACK_MIN_DISCOUNT", "40"))):
+        print(f"defer low_discount {pct}%")
+        raise SystemExit(2)
+    link = f"https://www.amazon.in/dp/{asin}?tag={TAG}"
+    lines = [title, f"🔥 डील: <b>{price}</b>"] + ([f"💰 MRP: <b><s>{mrp}</s></b>"] if mrp else [])
+    lines += [f"⏰ समय: {stamp_now()}", "", "Amazon Associate: क्वालिफाइंग परचेज़ से कमीशन"]
+    res = api("sendMessage", {"chat_id": chat_id(), "text": "\n".join(lines), "parse_mode": "HTML",
+                              "reply_markup": {"inline_keyboard": [[{"text": "🛒 Buy Now", "url": link}]]}})
+    print("asin", asin, "post_id", res.get("message_id"), "source_price")
+
+
+def chat_id():
+    return int(CHANNEL) if CHANNEL.lstrip("-").isdigit() else CHANNEL
+
+
+def stamp_now():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    hour = now.strftime("%I").lstrip("0") or "12"
+    return now.strftime(f"%d %b %Y, {hour}:%M %p IST")
+
+
 def main():
     if len(sys.argv) < 2:
         die("need a url")
@@ -157,6 +274,12 @@ def main():
     started = time.perf_counter()
     try:
         final, html = fetch(sys.argv[1])
+    except Captcha:
+        src = [a for a in args if a.startswith("--src-price=")]
+        if not (src and os.environ.get("TRACK_SOURCE_PRICE") == "1" and "--final-try" in args):
+            print("captcha robot-check page (retry later)")
+            raise SystemExit(4)
+        return source_post(sys.argv[1], args, tracker, allow_low, user_sent)
     except urllib.error.HTTPError as exc:
         die(f"amazon HTTP {exc.code}")
     except Exception as exc:
