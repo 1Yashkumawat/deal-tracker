@@ -153,7 +153,17 @@ def flush_retry():
         (due if it["due"] <= now else keep).append(it)
     json.dump(keep, open(RETRY, "w"), ensure_ascii=False)
     for it in due:
-        final = it["attempt"] >= len(BACKOFF_S)
+        m = it["meta"]
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(m.get("src_time") or m.get("post_time"))).total_seconds()
+        except Exception:
+            age = 0
+        if it["dry"]:
+            age = 0  # dry-run probes measure fetch success only
+        if age > (2700 if it["allow_low"] else MAX_AGE_S) or (it["dry"] and os.environ.get("TRACK_AUTOPOST") == "1"):
+            print("drop stale captcha retry", it["asin"], "age", int(age), flush=True)
+            continue
+        final = it["attempt"] >= len(BACKOFF_S) or age > MAX_AGE_S - 120
         if it["dry"]:
             probe_one(it["asin"], it["meta"], it["attempt"], final)
         else:
