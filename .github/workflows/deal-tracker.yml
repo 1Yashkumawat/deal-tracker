@@ -64,7 +64,8 @@ jobs:
           key: tracker-state-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Alert on unexpected end
         if: failure() || cancelled()
-        run: python3 run_slot.py --alert run_ended "Run ended unexpectedly (${{ job.status }}): ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          python3 run_slot.py --alert run_ended "Run ended unexpectedly (${{ job.status }}) - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
   keepalive:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
