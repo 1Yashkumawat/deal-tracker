@@ -100,5 +100,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: gautamkrishnar/keepalive-workflow@v2
+      - name: Keep scheduled workflow enabled (resets 60-day inactivity timer)
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/deal-tracker.yml/enable" && echo "workflow re-enabled"
