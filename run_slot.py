@@ -171,12 +171,26 @@ def main():
     posted_seen = sum(1 for _ in open(pd.POSTED)) if os.path.exists(pd.POSTED) else 0
     msg_id, last_hb, fetch_fail_since, last_err, amz_fail_streak = None, 0, None, "", 0
     interval = int(os.environ.get("TRACK_INTERVAL", "10"))
+    zero_links_since = None
+    ZERO_LINKS_S, ZERO_LINKS_ALERT_GAP_S = 3600, 6 * 3600
     while datetime.now(IST) < end:
         t = datetime.now(IST)
         try:
             n = pd.run_once()
             fetch_fail_since = None
             print(t.strftime("%H:%M:%S"), "new", len(n), flush=True)
+            if pd.LAST_STATS["posts"] and not pd.LAST_STATS["amazon_links"]:
+                zero_links_since = zero_links_since or time.time()
+                if time.time() - zero_links_since > ZERO_LINKS_S:
+                    print("WARNING no Amazon links parsed for", int((time.time()-zero_links_since)/60), "min", flush=True)
+                    try:
+                        last_zl = json.load(open(ALERTS_FILE)).get("no_amazon_links", 0)
+                    except Exception:
+                        last_zl = 0
+                    if time.time() - last_zl > ZERO_LINKS_ALERT_GAP_S:
+                        alert("no_amazon_links", f"t.me/s/{pd.CHANNEL}: posts seen but 0 Amazon links parsed for {int((time.time()-zero_links_since)/60)} min (new link domain?)")
+            else:
+                zero_links_since = None
         except Exception as e:
             last_err = f"{t.strftime('%H:%M')} t.me fetch {type(e).__name__}"
             print(t.strftime("%H:%M:%S"), "error", type(e).__name__, e, flush=True)

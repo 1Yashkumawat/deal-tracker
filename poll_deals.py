@@ -30,6 +30,42 @@ def fetch():
         return r.read().decode("utf-8", "replace")
 
 
+AMZ_RE = re.compile(r"(amazon\.in|amzn\.(to|in)|amzn-to\.co)")
+SHORT_RE = re.compile(r"(amzn\.(to|in)|amzn-to\.co)/")
+KNOWN_HOSTS = ("t.me", "telegram.org", "telegram.me", "telegra.ph")
+UNKNOWN_DOMAINS = set()
+LAST_STATS = {"posts": 0, "amazon_links": 0}
+
+
+def note_domain(u):
+    """Log each non-Amazon link domain once per process (helps spot a new Amazon shortener)."""
+    m = re.match(r"https?://([^/?#]+)", u)
+    if not m:
+        return
+    h = m.group(1).lower()
+    if h.startswith("www."):
+        h = h[4:]
+    if h.endswith(KNOWN_HOSTS) or h in UNKNOWN_DOMAINS:
+        return
+    UNKNOWN_DOMAINS.add(h)
+    print("unknown link domain seen:", h, flush=True)
+
+
+def resolve(u):
+    """Follow redirects of an Amazon short link to the final amazon.in URL. Returns u on failure."""
+    if not SHORT_RE.search(u):
+        return u
+    try:
+        req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.geturl()
+    except urllib.error.HTTPError as e:
+        return e.geturl() or u  # amazon may 503 the final page; the redirected URL is still known
+    except Exception as e:
+        print("resolve failed", re.sub(r"[?#].*", "", u), type(e).__name__, flush=True)
+        return u
+
+
 def parse(page):
     blocks = re.split(r'(?=<div class="tgme_widget_message_wrap)', page)
     posts = []
@@ -48,10 +84,14 @@ def parse(page):
         links = []
         for h in re.findall(r'href="([^"]+)"', b):
             u = html.unescape(html.unescape(h))
-            if re.search(r"(amazon\.in|amzn\.(to|in))", u):
+            if AMZ_RE.search(u):
                 links.append(u)
+            else:
+                note_domain(u)
         posts.append({"post": pid, "time": t.group(1) if t else None, "title": title[:160], "links": links,
                       "src_price": source_price(text)})
+    LAST_STATS["posts"] = len(posts)
+    LAST_STATS["amazon_links"] = sum(len(x["links"]) for x in posts)
     return posts
 
 
@@ -274,6 +314,12 @@ def run_once():
             k = key_for(u)
             if k in seen:
                 continue
+            if SHORT_RE.search(u):  # short link: resolve to the real amazon.in URL / ASIN
+                seen[k] = {"post": p["post"], "first_seen": datetime.now(IST).isoformat(timespec="seconds")}
+                u = resolve(u)
+                k = key_for(u)
+                if k in seen:
+                    continue
             seen[k] = {"post": p["post"], "first_seen": datetime.now(IST).isoformat(timespec="seconds")}
             rec = {"channel": CHANNEL, "post": p["post"], "post_time": p["time"], "title": p["title"], "src_price": p["src_price"],
                    "key": k, "url": u, "found_at": seen[k]["first_seen"]}
